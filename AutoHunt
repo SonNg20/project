@@ -68,10 +68,10 @@ local CONFIG = {
     MinGoldenTier = 2,              -- Chỉ bắt Golden từ Tier 2 (Rare) trở lên
 
     CatchRainbow = true,
-    MinRainbowTier = 1,             -- Bắt Rainbow từ Tier 1 trở lên
+    MinRainbowTier = 2,             -- Bắt Rainbow từ Tier 1 trở lên
 
     CatchShiny = true,
-    MinShinyTier = 1,               -- Bắt Shiny từ Tier 1 trở lên
+    MinShinyTier = 2,               -- Bắt Shiny từ Tier 1 trở lên
 
     MinCatchPercent = 0,            -- Tỉ lệ bắt tối thiểu (%)
 
