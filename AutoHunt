@@ -1,10 +1,10 @@
 -- ============================================================================
--- STANDALONE AUTO HUNT (WILD PET + TURKEY SIGHTING) + WEBHOOK RANK REPORTER
+-- STANDALONE AUTO HUNT (WILD PET + TURKEY SIGHTING) + DISCORD WEBHOOK STATS
 -- DỪNG HOÀN TOÀN KHI CÓ TURKEY BOSS (KHÔNG DỊCH CHUYỂN ĐẾN BOSS)
 -- ============================================================================
 
 getgenv().StopAllScript = false
-local HubName = "S"
+local HubName = "SonNg"
 
 -- ==================== [1] SERVICES & MODULES ====================
 
@@ -51,12 +51,13 @@ local CONFIG = {
     ScanInterval = 15,              -- Chu kỳ quét Wild Pet (giây)
     BossCheckInterval = 2,          -- Chu kỳ kiểm tra trạng thái Turkey Boss (giây)
 
-    -- 0. Báo cáo BXH về Discord Webhook (Mỗi 5 phút = 300 giây):
-    LeaderboardWebhook = {
+    -- 0. Báo cáo Webhook (Tên | Rank | Score | Catched | Fail):
+    Webhook = {
         Enabled = true,
         BoardId = "PumpkinTycoonCatches",
-        ReportInterval = 300,       -- 5 phút gửi 1 lần
-        SendOnStart = true,         -- Gửi 1 lần ngay khi vừa chạy script để kiểm tra
+        ReportInterval = 300,       -- Chu kỳ gửi báo cáo định kỳ (300s = 5 phút)
+        SendOnStart = true,         -- Gửi báo cáo đầu tiên ngay khi khởi chạy
+        SendOnCatchResult = false,  -- Đặt true nếu muốn gửi Webhook ngay sau mỗi lần bắt/trượt
     },
 
     -- 1. Nhóm Huge / Titanic / Gargantuan (Tier 4):
@@ -80,7 +81,7 @@ local CONFIG = {
 
     -- 4. Cấu hình vợt:
     UseUltraOnJackpot = true,       -- Dùng Ultra Pet Net cho Huge / Titanic / Gargantuan
-    FallbackNormalNet = true,      -- Dùng tạm Pet Net cho Wild Jackpot nếu hết Ultra?
+    FallbackNormalNet = false,      -- Dùng tạm Pet Net cho Wild Jackpot nếu hết Ultra?
     NormalPetNet = "Pet Net",
     UltraPetNet = "Ultra Pet Net",
 
@@ -101,6 +102,8 @@ local State = {
     lastThrowTime = 0,
     latestRank = "N/A",
     latestScore = "0",
+    caughtCount = 0,
+    failCount = 0,
 }
 
 local Connections = {}
@@ -125,18 +128,18 @@ local function cleanupAll()
     table_clear(PetJackpotCache)
 end
 
--- ==================== [4] BÁO CÁO BXH QUA DISCORD WEBHOOK ====================
+-- ==================== [4] DISCORD WEBHOOK REPORTER ====================
 
 local function syncLatestLeaderboardData()
-    local ok, myData = pcall(LeaderboardCmds.GetMyData, CONFIG.LeaderboardWebhook.BoardId)
+    local ok, myData = pcall(LeaderboardCmds.GetMyData, CONFIG.Webhook.BoardId)
     if ok and myData then
         State.latestRank = tostring(myData.GlobalRank or "N/A")
         State.latestScore = tostring(myData.Score or 0)
     end
 end
 
-local function sendLeaderboardToWebhook()
-    if not CONFIG.LeaderboardWebhook.Enabled then return end
+local function sendStatsToWebhook(reasonTag)
+    if not CONFIG.Webhook.Enabled then return end
     if not reqFunc or not getgenv().WebhookURL or getgenv().WebhookURL == "" then return end
 
     syncLatestLeaderboardData()
@@ -144,22 +147,31 @@ local function sendLeaderboardToWebhook()
     local playerName = LocalPlayer.Name
     local rankStr = "#" .. State.latestRank
     local scoreStr = State.latestScore
+    local totalThrows = State.caughtCount + State.failCount
+    local catchRate = (totalThrows > 0) and ((State.caughtCount / totalThrows) * 100) or 0
+
+    local ping = (getgenv().UserID and getgenv().UserID ~= "") and ("<@" .. getgenv().UserID .. ">") or ""
 
     local embed = {
-        title = "🏆 Cập Nhật BXH Pumpkin Tycoon",
+        title = reasonTag and ("🐾 Auto Hunt Update • " .. reasonTag) or "🏆 Auto Hunt & BXH Report",
         description = string.format("**%s | %s | %s**", playerName, rankStr, scoreStr),
         color = 16766720,
         fields = {
-            { name = "👤 Tài khoản", value = "||**" .. playerName .. "**||", inline = true },
-            { name = "🏅 Rank",      value = "`" .. rankStr .. "`",          inline = true },
-            { name = "🎯 Score",     value = "`" .. scoreStr .. "`",         inline = true },
+            { name = "👤 Tên / Rank / Score", value = string.format("`%s | %s | %s`", playerName, rankStr, scoreStr), inline = false },
+            { name = "✅ Catched",            value = "`" .. tostring(State.caughtCount) .. "`",                       inline = true },
+            { name = "❌ Fail",               value = "`" .. tostring(State.failCount) .. "`",                         inline = true },
+            { name = "📊 Tỉ lệ bắt",         value = string.format("`%.1f%%`", catchRate),                              inline = true },
         },
         footer = {
             text = "⚡ powered by " .. HubName .. " • " .. os.date("%H:%M:%S %d/%m"),
         },
     }
 
-    local payload = HttpService:JSONEncode({ embeds = { embed } })
+    local payload = HttpService:JSONEncode({
+        content = ping,
+        embeds = { embed },
+    })
+
     task_spawn(function()
         pcall(reqFunc, {
             Url = getgenv().WebhookURL,
@@ -170,12 +182,24 @@ local function sendLeaderboardToWebhook()
     end)
 end
 
-local function initLeaderboardWebhook()
-    if not CONFIG.LeaderboardWebhook.Enabled then return end
+local function recordCatchOutcome(isCaught, petLabel)
+    if isCaught then
+        State.caughtCount = State.caughtCount + 1
+    else
+        State.failCount = State.failCount + 1
+    end
 
-    -- Cập nhật ngầm vào State mỗi khi server đẩy dữ liệu BXH mới
+    if CONFIG.Webhook.SendOnCatchResult then
+        local statusText = (isCaught and "Catched: " or "Fail: ") .. tostring(petLabel or "Pet")
+        sendStatsToWebhook(statusText)
+    end
+end
+
+local function initWebhookSystem()
+    syncLatestLeaderboardData()
+
     pcall(function()
-        LeaderboardCmds.AddListener(CONFIG.LeaderboardWebhook.BoardId, function(boardData)
+        LeaderboardCmds.AddListener(CONFIG.Webhook.BoardId, function(boardData)
             if not isRunning() then return end
             if boardData and boardData.LocalPlayer then
                 State.latestRank = tostring(boardData.LocalPlayer.GlobalRank or "N/A")
@@ -184,22 +208,23 @@ local function initLeaderboardWebhook()
         end)
     end)
 
-    -- Vòng lặp gửi thông báo định kỳ mỗi 5 phút (300s)
-    task_spawn(function()
-        if CONFIG.LeaderboardWebhook.SendOnStart then
-            task_wait(2)
-            if isRunning() then
-                sendLeaderboardToWebhook()
+    if CONFIG.Webhook.Enabled then
+        task_spawn(function()
+            if CONFIG.Webhook.SendOnStart then
+                task_wait(2)
+                if isRunning() then
+                    sendStatsToWebhook("Started")
+                end
             end
-        end
 
-        while isRunning() do
-            task_wait(CONFIG.LeaderboardWebhook.ReportInterval)
-            if isRunning() then
-                sendLeaderboardToWebhook()
+            while isRunning() do
+                task_wait(CONFIG.Webhook.ReportInterval)
+                if isRunning() then
+                    sendStatsToWebhook("Periodic")
+                end
             end
-        end
-    end)
+        end)
+    end
 end
 
 -- ==================== [5] KIỂM TRA TURKEY BOSS (KHÔNG TELEPORT) ====================
@@ -394,7 +419,9 @@ local function catchWildPet(info, netName)
             return false
         end
 
-        print(string.format(resultTable.caught and "✅ [Auto Hunt] Bắt thành công: %s%s!" or "❌ [Auto Hunt] Trượt mất: %s%s!", info.name, info.variantStr))
+        local wasCaught = resultTable.caught == true
+        recordCatchOutcome(wasCaught, info.name .. info.variantStr)
+        print(string.format(wasCaught and "✅ [Auto Hunt] Bắt thành công: %s%s!" or "❌ [Auto Hunt] Trượt mất: %s%s!", info.name, info.variantStr))
 
         if CONFIG.PlayCatchAnimation and NetsFeature and NetsFeature.Play then
             physicalData.Catching = true
@@ -443,7 +470,9 @@ local function checkAndCatchTurkeySighting()
     local throwOk, caughtSuccess, outcome = pcall(TurkeyFeature.Throw, chosenNet)
     State.lastThrowTime = Workspace:GetServerTimeNow()
 
-    if throwOk and caughtSuccess then
+    if throwOk and caughtSuccess and outcome ~= "soldout" then
+        local wasCaught = (outcome == "caught" or outcome == true)
+        recordCatchOutcome(wasCaught, tostring(state.shown.pet))
         print(string.format("🎯 [Turkey Sighting] Kết quả: %s", tostring(outcome)))
         if CONFIG.PlayCatchAnimation then task_wait(2.5) end
         return true
@@ -453,7 +482,7 @@ end
 
 -- ==================== [8] EVENTS & MAIN LOOPS ====================
 
-initLeaderboardWebhook()
+initWebhookSystem()
 
 -- Theo dõi tức thì khi Turkey Boss xuất hiện hoặc biến mất
 local breakablesContainer = getBreakablesContainer()
@@ -509,7 +538,7 @@ end)
 
 -- Vòng lặp quét & bắt Wild Pet chính (dừng hoàn toàn cho đến khi Boss biến mất)
 task_spawn(function()
-    print("🚀 [Auto Hunt] Đã kích hoạt! Dừng săn tại chỗ khi có Turkey Boss + Gửi BXH mỗi 5p.")
+    print("🚀 [Auto Hunt] Đã kích hoạt! Dừng săn tại chỗ khi có Turkey Boss + Webhook Stats.")
     while isRunning() do
         if not syncBossState() and not State.isHunting then
             pcall(function()
