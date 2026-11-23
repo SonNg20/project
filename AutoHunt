@@ -1,0 +1,553 @@
+-- ============================================================================
+-- STANDALONE AUTO HUNT (WILD PET + TURKEY SIGHTING) + LEADERBOARD RANK UI
+-- DỪNG HOÀN TOÀN KHI CÓ TURKEY BOSS (KHÔNG DỊCH CHUYỂN ĐẾN BOSS)
+-- ============================================================================
+
+getgenv().StopAllScript = false
+
+-- ==================== [1] SERVICES & MODULES ====================
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local Library = ReplicatedStorage:WaitForChild("Library")
+local Client = Library:WaitForChild("Client")
+
+local PumpkinTycoonCmds = require(Client:WaitForChild("PumpkinTycoonCmds"))
+local LeaderboardCmds = require(Client:WaitForChild("LeaderboardCmds"))
+local Island = require(Client.PumpkinTycoonCmds.Island)
+local PumpkinTycoon = require(Library.Types.PumpkinTycoon)
+local WildTypes = require(Library.Types.PumpkinTycoon.Wild)
+local PumpkinTycoonWild = require(Library.Util.PumpkinTycoonWild)
+local PumpkinTycoonSighting = require(Library.Util.PumpkinTycoonSighting)
+local PumpkinTycoonTurkey = require(Library.Util.PumpkinTycoonTurkey)
+local PetItem = require(Library.Items.PetItem)
+local MiscItem = require(Library.Items.MiscItem)
+
+local ClientNetwork = nil
+pcall(function() ClientNetwork = require(Client:WaitForChild("Network")) end)
+
+local WildFeature = PumpkinTycoonCmds.Feature("Wild")
+local NetsFeature = PumpkinTycoonCmds.Feature("Nets")
+local TurkeyFeature = PumpkinTycoonCmds.Feature("Turkey")
+
+local table_insert = table.insert
+local table_clear = table.clear
+local table_sort = table.sort
+local string_find = string.find
+local task_spawn = task.spawn
+local task_wait = task.wait
+
+-- ==================== [2] CONFIGURATION ====================
+
+local CONFIG = {
+    Enabled = true,
+    ScanInterval = 15,              -- Chu kỳ quét Wild Pet (giây)
+    BossCheckInterval = 2,          -- Chu kỳ kiểm tra trạng thái Turkey Boss (giây)
+
+    -- 0. Hiển thị BXH (Leaderboard UI):
+    Leaderboard = {
+        Enabled = true,
+        BoardId = "PumpkinTycoonCatches",
+        RainbowSpeed = 0.35,
+    },
+
+    -- 1. Nhóm Huge / Titanic / Gargantuan (Tier 4):
+    AlwaysCatchJackpot = true,      -- 100% bắt ngay khi gặp
+
+    -- 2. Bắt theo bậc Tier (1 = Uncommon | 2 = Rare | 3 = Epic):
+    CatchEpic = true,               -- Bắt tất cả Tier 3 (Epic)
+    MinTier = 3,
+
+    -- 3. Bắt riêng theo từng loại Variant:
+    CatchGolden = true,
+    MinGoldenTier = 2,              -- Chỉ bắt Golden từ Tier 2 (Rare) trở lên
+
+    CatchRainbow = true,
+    MinRainbowTier = 1,             -- Bắt Rainbow từ Tier 1 trở lên
+
+    CatchShiny = true,
+    MinShinyTier = 1,               -- Bắt Shiny từ Tier 1 trở lên
+
+    MinCatchPercent = 0,            -- Tỉ lệ bắt tối thiểu (%)
+
+    -- 4. Cấu hình vợt:
+    UseUltraOnJackpot = true,       -- Dùng Ultra Pet Net cho Huge / Titanic / Gargantuan
+    FallbackNormalNet = false,      -- Dùng tạm Pet Net cho Wild Jackpot nếu hết Ultra?
+    NormalPetNet = "Pet Net",
+    UltraPetNet = "Ultra Pet Net",
+
+    -- 5. Turkey Sighting (Huge/Titanic/Garg spawn sau khi Boss biến mất):
+    CatchSighting = true,
+    SightingFallbackNormalNet = true,
+
+    -- 6. Tiện ích:
+    TeleportToPet = true,
+    PlayCatchAnimation = true,
+}
+
+-- ==================== [3] STATE & LIFECYCLE ====================
+
+local State = {
+    isBossActive = false,
+    isHunting = false,
+    lastThrowTime = 0,
+}
+
+local Connections = {}
+local PooledCandidates = {}
+local PetJackpotCache = {}
+local ActiveRankGui = nil
+
+local function trackConnection(conn)
+    if conn then table_insert(Connections, conn) end
+    return conn
+end
+
+local function isRunning()
+    return CONFIG.Enabled and not getgenv().StopAllScript
+end
+
+local function cleanupAll()
+    for i = #Connections, 1, -1 do
+        pcall(function() Connections[i]:Disconnect() end)
+        Connections[i] = nil
+    end
+    if ActiveRankGui then
+        pcall(function() ActiveRankGui:Destroy() end)
+        ActiveRankGui = nil
+    end
+    table_clear(PooledCandidates)
+    table_clear(PetJackpotCache)
+end
+
+-- ==================== [4] HỆ THỐNG HIỂN THỊ BXH (LEADERBOARD UI) ====================
+
+local function initLeaderboardUI()
+    if not CONFIG.Leaderboard.Enabled then return end
+
+    local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+    local oldGui = playerGui:FindFirstChild("PumpkinRankRainbowGUI")
+    if oldGui then
+        oldGui:Destroy()
+    end
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "PumpkinRankRainbowGUI"
+    screenGui.ResetOnSpawn = false
+    screenGui.IgnoreGuiInset = true
+    screenGui.DisplayOrder = 999
+    screenGui.Parent = playerGui
+    ActiveRankGui = screenGui
+
+    local rankLabel = Instance.new("TextLabel")
+    rankLabel.Name = "RankDisplay"
+    rankLabel.Size = UDim2.new(0, 350, 0, 32)
+    rankLabel.Position = UDim2.new(0, 30, 0, 30)
+    rankLabel.BackgroundTransparency = 1
+    rankLabel.TextXAlignment = Enum.TextXAlignment.Left
+    rankLabel.TextYAlignment = Enum.TextYAlignment.Center
+    rankLabel.Font = Enum.Font.FredokaOne
+    rankLabel.TextSize = 20
+    rankLabel.TextStrokeTransparency = 0.2
+    rankLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+    rankLabel.Text = "Rank: Loading... | Score: ..."
+    rankLabel.Parent = screenGui
+
+    -- Hiệu ứng đổi màu cầu vồng (tự ngắt khi StopAllScript = true)
+    local hue = 0
+    trackConnection(RunService.RenderStepped:Connect(function(dt)
+        if not isRunning() or not rankLabel or not rankLabel.Parent then return end
+        hue = (hue + dt * CONFIG.Leaderboard.RainbowSpeed) % 1
+        rankLabel.TextColor3 = Color3.fromHSV(hue, 0.9, 1)
+    end))
+
+    local function updateDisplay(myData)
+        if not rankLabel or not rankLabel.Parent then return end
+        if myData then
+            local rank = tostring(myData.GlobalRank or "N/A")
+            local score = tostring(myData.Score or 0)
+            rankLabel.Text = string.format("Rank: #%s | Score: %s", rank, score)
+        else
+            rankLabel.Text = "Rank: N/A | Score: 0"
+        end
+    end
+
+    local boardId = CONFIG.Leaderboard.BoardId
+    local ok, initialData = pcall(LeaderboardCmds.GetMyData, boardId)
+    if ok then
+        updateDisplay(initialData)
+    end
+
+    pcall(function()
+        LeaderboardCmds.AddListener(boardId, function(boardData)
+            if not isRunning() then return end
+            if boardData and boardData.LocalPlayer then
+                updateDisplay(boardData.LocalPlayer)
+            end
+        end)
+    end)
+end
+
+-- ==================== [5] KIỂM TRA TURKEY BOSS (KHÔNG TELEPORT) ====================
+
+local function getBreakablesContainer()
+    local things = Workspace:FindFirstChild("__THINGS")
+    return (things and things:FindFirstChild("Breakables")) or Workspace:FindFirstChild("Breakables")
+end
+
+local function isTurkeyBossActive()
+    local things = Workspace:FindFirstChild("__THINGS")
+    local instances = things and things:FindFirstChild("Instances")
+    local tycoonInst = instances and instances:FindFirstChild(PumpkinTycoon.INSTANCE_ID)
+    local sharedIsland = tycoonInst and tycoonInst:FindFirstChild(Island.SHARED_NAME)
+    if sharedIsland and sharedIsland:GetAttribute(PumpkinTycoonTurkey.ATTR.Alive) == true then
+        return true
+    end
+
+    local container = getBreakablesContainer()
+    if container then
+        for _, b in ipairs(container:GetChildren()) do
+            if b:IsA("Model") and b:GetAttribute("BreakableID") == PumpkinTycoonTurkey.CHEST_ID then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function syncBossState()
+    local active = isTurkeyBossActive()
+    if active and not State.isBossActive then
+        State.isBossActive = true
+        print("🦃 [Auto Hunt] Phát hiện Turkey Boss -> DỪNG săn pet tại chỗ (chờ Boss biến mất)...")
+    elseif not active and State.isBossActive then
+        State.isBossActive = false
+        print("✅ [Auto Hunt] Turkey Boss đã biến mất -> TIẾP TỤC săn pet!")
+    end
+    return active
+end
+
+-- ==================== [6] PHÂN TÍCH & LỌC PET ====================
+
+local speciesLookup = {}
+for zone = 1, 8 do
+    speciesLookup[zone] = {}
+    local ok, list = pcall(WildTypes.Species, zone)
+    if ok and type(list) == "table" then
+        for _, sp in ipairs(list) do
+            speciesLookup[zone][sp.PetId] = sp
+        end
+    end
+end
+
+local function getNetCount(netName)
+    local ok, res = pcall(function() return MiscItem(netName):CountExact() end)
+    return (ok and type(res) == "number") and res or 0
+end
+
+local function getPetRarityMeta(petId, spData)
+    local cached = PetJackpotCache[petId]
+    if cached then return cached.isJackpot, cached.tierName end
+
+    local isGarg = string_find(petId, "^Gargantuan ") ~= nil
+    local isTitan = string_find(petId, "^Titanic ") ~= nil
+    local isHuge = (spData and spData.Huge == true) or (string_find(petId, "^Huge ") ~= nil)
+
+    pcall(function()
+        local item = PetItem(petId)
+        if item:IsGargantuan() then isGarg = true end
+        if item:IsTitanic() then isTitan = true end
+        if item:IsHuge() then isHuge = true end
+    end)
+
+    local isJackpot = isGarg or isTitan or isHuge
+    local tierName = isGarg and "GARGANTUAN" or (isTitan and "TITANIC" or (isHuge and "HUGE" or nil))
+    PetJackpotCache[petId] = { isJackpot = isJackpot, tierName = tierName }
+    return isJackpot, tierName
+end
+
+local function analyzeWildPet(slot, data)
+    local entry = data.Entry or {}
+    local zone = tonumber(entry.Z) or 0
+    local petId = tostring(entry.P or "Unknown")
+    local spData = speciesLookup[zone] and speciesLookup[zone][petId]
+
+    local isJackpot, jackpotTierName = getPetRarityMeta(petId, spData)
+    local tier = (spData and spData.Tier) or (isJackpot and (WildTypes.HUGE_TIER or 4) or 1)
+    local tierName = jackpotTierName or WildTypes.TIERS[tier + 1] or ("Tier " .. tostring(tier))
+
+    local variantRank = (entry.S and 4 or 0) + (entry.R and 2 or 0) + (entry.G and 1 or 0)
+    local variantStr = ""
+    if variantRank > 0 then
+        local v = {}
+        if entry.S then table_insert(v, "Shiny") end
+        if entry.R then table_insert(v, "Rainbow") end
+        if entry.G then table_insert(v, "Golden") end
+        variantStr = " [" .. table.concat(v, "+") .. "]"
+    end
+
+    return {
+        slot = data.Slot or slot,
+        raw = data,
+        entry = entry,
+        name = petId,
+        tier = tier,
+        tierName = tierName,
+        isJackpot = isJackpot,
+        variantRank = variantRank,
+        variantStr = variantStr,
+        baseChance = tonumber(data.CatchChance or entry.C) or 0,
+        pos = data.At,
+    }
+end
+
+local function shouldCatchPet(info)
+    if not info or not info.raw or info.raw.Catching or info.raw.AttemptingCatch then return false end
+    if info.isJackpot then return CONFIG.AlwaysCatchJackpot end
+    if (info.baseChance * 100) < CONFIG.MinCatchPercent then return false end
+    if CONFIG.CatchEpic and info.tier >= CONFIG.MinTier then return true end
+
+    local e = info.entry
+    return (CONFIG.CatchShiny and e.S == true and info.tier >= CONFIG.MinShinyTier)
+        or (CONFIG.CatchRainbow and e.R == true and info.tier >= CONFIG.MinRainbowTier)
+        or (CONFIG.CatchGolden and e.G == true and info.tier >= CONFIG.MinGoldenTier)
+end
+
+local function selectBestNet(isJackpot, fallbackNormal)
+    local ultra = getNetCount(CONFIG.UltraPetNet)
+    local normal = getNetCount(CONFIG.NormalPetNet)
+    if isJackpot and CONFIG.UseUltraOnJackpot then
+        if ultra > 0 then return CONFIG.UltraPetNet end
+        if fallbackNormal and normal > 0 then return CONFIG.NormalPetNet end
+        return nil
+    end
+    return (normal > 0) and CONFIG.NormalPetNet or nil
+end
+
+-- ==================== [7] DỊCH CHUYỂN ĐẾN PET & QUĂNG VỢT ====================
+
+local function teleportToPet(pos)
+    if not isRunning() or syncBossState() or not pos then return false end
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        hrp.Anchored = false
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 4))
+        task_wait(0.2)
+        return not syncBossState()
+    end
+    return false
+end
+
+local function waitThrowCooldown()
+    local cd = PumpkinTycoonWild.ThrowSeconds() or 3
+    local elapsed = Workspace:GetServerTimeNow() - State.lastThrowTime
+    if elapsed < cd then
+        task_wait(cd - elapsed + 0.05)
+    end
+end
+
+local function catchWildPet(info, netName)
+    if syncBossState() or not isRunning() then return false end
+    local plot = Island.Plot()
+    if not plot then return false end
+
+    waitThrowCooldown()
+    if syncBossState() or not isRunning() then return false end
+
+    local physicalData = WildFeature and WildFeature.Physical(info.slot)
+    if not physicalData or physicalData.Catching or physicalData.AttemptingCatch then return false end
+
+    if CONFIG.TeleportToPet and info.pos then
+        if not teleportToPet(info.pos) then return false end
+    end
+
+    physicalData.AttemptingCatch = true
+    print(string.format("🎯 [Auto Hunt] Đang bắt: %s (%s%s) | Vợt: [%s]", info.name, info.tierName, info.variantStr, netName))
+
+    local ok, invoked, reason, resultTable = pcall(function()
+        return plot:Invoke(PumpkinTycoon.NET.CatchWild, info.slot, netName)
+    end)
+    State.lastThrowTime = Workspace:GetServerTimeNow()
+
+    if ok and invoked and type(resultTable) == "table" then
+        if resultTable.outcome == "soldout" then
+            physicalData.AttemptingCatch = false
+            pcall(WildFeature.Respawn, info.slot)
+            return false
+        end
+
+        print(string.format(resultTable.caught and "✅ [Auto Hunt] Bắt thành công: %s%s!" or "❌ [Auto Hunt] Trượt mất: %s%s!", info.name, info.variantStr))
+
+        if CONFIG.PlayCatchAnimation and NetsFeature and NetsFeature.Play then
+            physicalData.Catching = true
+            pcall(NetsFeature.Play, physicalData, resultTable, nil, false)
+            task_wait(2.5)
+        else
+            physicalData.AttemptingCatch = false
+            physicalData.Catching = false
+            pcall(WildFeature.Respawn, info.slot)
+        end
+        return true
+    else
+        physicalData.AttemptingCatch = false
+        warn("⚠️ [Auto Hunt] Server từ chối: " .. tostring(reason or invoked))
+        return false
+    end
+end
+
+local function checkAndCatchTurkeySighting()
+    if not CONFIG.CatchSighting or syncBossState() or not isRunning() then return false end
+    TurkeyFeature = TurkeyFeature or PumpkinTycoonCmds.Feature("Turkey")
+    if not TurkeyFeature or type(TurkeyFeature.TestState) ~= "function" then return false end
+
+    local ok, rawJson = pcall(TurkeyFeature.TestState)
+    if not ok or type(rawJson) ~= "string" then return false end
+
+    local okDec, state = pcall(HttpService.JSONDecode, HttpService, rawJson)
+    if not okDec or type(state) ~= "table" or not state.shown or state.shown.soldOut or state.shown.thrown then
+        return false
+    end
+
+    local chosenNet = selectBestNet(true, CONFIG.SightingFallbackNormalNet)
+    if not chosenNet then
+        warn(string.format("⚠️ [Turkey Sighting] Phát hiện %s nhưng thiếu vợt!", tostring(state.shown.pet)))
+        return false
+    end
+
+    if CONFIG.TeleportToPet and type(state.pos) == "table" and #state.pos == 3 then
+        if not teleportToPet(Vector3.new(state.pos[1], state.pos[2], state.pos[3])) then return false end
+    end
+
+    waitThrowCooldown()
+    if syncBossState() or not isRunning() then return false end
+
+    print(string.format("🌟 [Turkey Sighting] Đang bắt %s (%s) | Vợt: [%s]", tostring(state.shown.pet), tostring(state.shown.slot), chosenNet))
+    local throwOk, caughtSuccess, outcome = pcall(TurkeyFeature.Throw, chosenNet)
+    State.lastThrowTime = Workspace:GetServerTimeNow()
+
+    if throwOk and caughtSuccess then
+        print(string.format("🎯 [Turkey Sighting] Kết quả: %s", tostring(outcome)))
+        if CONFIG.PlayCatchAnimation then task_wait(2.5) end
+        return true
+    end
+    return false
+end
+
+-- ==================== [8] EVENTS & MAIN LOOPS ====================
+
+initLeaderboardUI()
+
+-- Theo dõi tức thì khi Turkey Boss xuất hiện hoặc biến mất
+local breakablesContainer = getBreakablesContainer()
+if breakablesContainer then
+    trackConnection(breakablesContainer.ChildAdded:Connect(function(child)
+        if isRunning() and child:GetAttribute("BreakableID") == PumpkinTycoonTurkey.CHEST_ID then
+            syncBossState()
+        end
+    end))
+    trackConnection(breakablesContainer.ChildRemoved:Connect(function(child)
+        if isRunning() and child:GetAttribute("BreakableID") == PumpkinTycoonTurkey.CHEST_ID then
+            task_wait(0.25)
+            syncBossState()
+        end
+    end))
+end
+
+-- Theo dõi tức thì sự kiện Turkey Sighting Pet spawn (chỉ chạy khi Boss đã biến mất)
+if ClientNetwork and type(ClientNetwork.Fired) == "function" then
+    pcall(function()
+        trackConnection(ClientNetwork.Fired(PumpkinTycoonSighting.REMOTE):Connect(function()
+            if CONFIG.CatchSighting and not syncBossState() and not State.isHunting and isRunning() then
+                task_spawn(function()
+                    task_wait(0.35)
+                    if syncBossState() then return end
+                    State.isHunting = true
+                    pcall(checkAndCatchTurkeySighting)
+                    State.isHunting = false
+                end)
+            end
+        end))
+    end)
+end
+
+-- Giám sát cờ dừng toàn cục getgenv().StopAllScript
+task_spawn(function()
+    while not getgenv().StopAllScript do
+        task_wait(0.3)
+    end
+    CONFIG.Enabled = false
+    cleanupAll()
+    print("🛑 [Auto Hunt] Đã dừng toàn bộ script và xóa Leaderboard UI (StopAllScript = true)!")
+end)
+
+-- Vòng lặp đồng bộ trạng thái Boss (mỗi 2s, chỉ đứng chờ, không dịch chuyển)
+task_spawn(function()
+    syncBossState()
+    while isRunning() do
+        task_wait(CONFIG.BossCheckInterval)
+        syncBossState()
+    end
+end)
+
+-- Vòng lặp quét & bắt Wild Pet chính (dừng hoàn toàn cho đến khi Boss biến mất)
+task_spawn(function()
+    print("🚀 [Auto Hunt] Đã kích hoạt! Dừng săn tại chỗ khi có Turkey Boss + Hiển thị BXH.")
+    while isRunning() do
+        if not syncBossState() and not State.isHunting then
+            pcall(function()
+                -- Ưu tiên bắt Turkey Sighting (Huge/Titanic/Gargantuan) sau khi Boss biến mất
+                if CONFIG.CatchSighting and TurkeyFeature and TurkeyFeature.Sighting and TurkeyFeature.Sighting() then
+                    State.isHunting = true
+                    checkAndCatchTurkeySighting()
+                    State.isHunting = false
+                end
+
+                if syncBossState() or not isRunning() then return end
+
+                WildFeature = WildFeature or PumpkinTycoonCmds.Feature("Wild")
+                NetsFeature = NetsFeature or PumpkinTycoonCmds.Feature("Nets")
+
+                if WildFeature and WildFeature.All then
+                    table_clear(PooledCandidates)
+                    for slot, data in pairs(WildFeature.All()) do
+                        local info = analyzeWildPet(slot, data)
+                        if shouldCatchPet(info) then
+                            table_insert(PooledCandidates, info)
+                        end
+                    end
+
+                    if #PooledCandidates > 0 and not syncBossState() and isRunning() then
+                        table_sort(PooledCandidates, function(a, b)
+                            if a.isJackpot ~= b.isJackpot then return a.isJackpot end
+                            if a.tier ~= b.tier then return a.tier > b.tier end
+                            if a.variantRank ~= b.variantRank then return a.variantRank > b.variantRank end
+                            return a.baseChance > b.baseChance
+                        end)
+
+                        local bestTarget = PooledCandidates[1]
+                        local chosenNet = selectBestNet(bestTarget.isJackpot, CONFIG.FallbackNormalNet)
+
+                        if chosenNet then
+                            State.isHunting = true
+                            catchWildPet(bestTarget, chosenNet)
+                            State.isHunting = false
+                        else
+                            warn(string.format("⚠️ [Auto Hunt] Thiếu vợt cho %s (%s%s)!", bestTarget.name, bestTarget.tierName, bestTarget.variantStr))
+                        end
+                    end
+                end
+            end)
+        end
+
+        task_wait(CONFIG.ScanInterval)
+    end
+end)
