@@ -1,0 +1,197 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+local GUI_NAME = "PumpkinCatches_Leaderboard_HUD"
+
+local function FormatCommas(value, fallback)
+    if type(value) ~= "number" or value ~= value or value == math.huge or value == -math.huge then
+        return fallback or "0"
+    end
+    local digits = string.format("%.0f", math.floor(value))
+    return (digits:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
+end
+
+local function SafeRequire(parent, ...)
+    local cur = parent
+    for _, name in ipairs({ ... }) do
+        if not cur then return nil end
+        cur = cur:FindFirstChild(name)
+    end
+    if not cur then return nil end
+    local ok, mod = pcall(require, cur)
+    return ok and mod or nil
+end
+
+local function GetGuiParent()
+    if type(gethui) == "function" then
+        local ok, ui = pcall(gethui)
+        if ok and ui then return ui end
+    end
+    local okCore = pcall(function() return CoreGui.Name end)
+    if okCore then return CoreGui end
+    return LocalPlayer and (LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10))
+end
+
+local Library = ReplicatedStorage:FindFirstChild("Library")
+local LeaderboardCmds = SafeRequire(Library, "Client", "LeaderboardCmds")
+local PumpkinContestsUtil = SafeRequire(Library, "Util", "PumpkinContestsUtil")
+
+local function GetLeaderboardData(customBoardId)
+    if not LeaderboardCmds then
+        LeaderboardCmds = SafeRequire(Library, "Client", "LeaderboardCmds")
+    end
+    if not PumpkinContestsUtil then
+        PumpkinContestsUtil = SafeRequire(Library, "Util", "PumpkinContestsUtil")
+    end
+
+    local boardId = customBoardId
+        or (PumpkinContestsUtil and PumpkinContestsUtil.BOARD_ID)
+        or "PumpkinTycoonCatches"
+
+    local rank, score = nil, 0
+
+    if LeaderboardCmds and type(LeaderboardCmds.Get) == "function" then
+        local okGet, state = pcall(LeaderboardCmds.Get, boardId)
+        if okGet and type(state) == "table" then
+            local myData = type(state.LocalPlayer) == "table" and state.LocalPlayer or nil
+            if myData then
+                local r = tonumber(myData.GlobalRank)
+                if r and r >= 1 and r == r and r < math.huge then
+                    rank = math.floor(r)
+                end
+                local s = tonumber(myData.Score)
+                if s and s >= 0 and s == s and s < math.huge then
+                    score = math.floor(s)
+                end
+            end
+        end
+    end
+
+    return {
+        rank = rank,
+        score = score,
+    }
+end
+
+local function MakeDraggable(guiObject)
+    local dragging = false
+    local activeInput = nil
+    local dragStart = Vector2.zero
+    local startPos = guiObject.Position
+
+    guiObject.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch
+        then
+            dragging = true
+            activeInput = input
+            dragStart = Vector2.new(input.Position.X, input.Position.Y)
+            startPos = guiObject.Position
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging or input ~= activeInput then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch
+        then
+            local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStart
+            guiObject.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input == activeInput then
+            dragging = false
+            activeInput = nil
+        end
+    end)
+end
+
+local function CreateLeftRainbowHud()
+    local targetParent = GetGuiParent()
+    if not targetParent then return end
+
+    local old = targetParent:FindFirstChild(GUI_NAME)
+    if old then
+        pcall(old.Destroy, old)
+    end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = GUI_NAME
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = 2147483647
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.IgnoreGuiInset = true
+    sg.Parent = targetParent
+
+    local body = Instance.new("TextLabel")
+    body.Name = "LeaderboardText"
+    body.AutomaticSize = Enum.AutomaticSize.XY
+    body.Size = UDim2.new(0, 0, 0, 0)
+    body.AnchorPoint = Vector2.new(0, 0)
+    body.Position = UDim2.new(0, 45, 0, 45) -- Góc trên bên trái, dưới Topbar
+    body.BackgroundTransparency = 1
+    body.Text = "Đang tải..."
+    body.Font = Enum.Font.GothamBlack
+    body.TextSize = 14
+    body.TextColor3 = Color3.fromRGB(255, 255, 255)
+    body.TextXAlignment = Enum.TextXAlignment.Left
+    body.TextYAlignment = Enum.TextYAlignment.Center
+    body.ZIndex = 1000000
+    body.Active = true
+    body.Parent = sg
+
+    -- Viền chữ đen mỏng giúp chữ cầu vồng nổi rõ kể cả trên nền trắng/sáng
+    local textStroke = Instance.new("UIStroke")
+    textStroke.Color = Color3.fromRGB(0, 0, 0)
+    textStroke.Thickness = 1.6
+    textStroke.Transparency = 0.2
+    textStroke.Parent = body
+
+    MakeDraggable(body)
+
+    local lastLbFetch = 0
+    local cachedData = GetLeaderboardData()
+    local lastText = ""
+
+    local function Render()
+        local now = os.clock()
+
+        -- Hiệu ứng đổi màu cầu vồng liên tục theo thời gian
+        local hue = (now * 0.25) % 1
+        body.TextColor3 = Color3.fromHSV(hue, 0.85, 1)
+
+        if (now - lastLbFetch) >= 0.35 then
+            lastLbFetch = now
+            cachedData = GetLeaderboardData()
+        end
+
+        local rankStr = cachedData.rank and ("#" .. FormatCommas(cachedData.rank)) or "Unranked"
+        local scoreStr = FormatCommas(cachedData.score)
+
+        local nextText = rankStr .. " | " .. scoreStr
+
+        if nextText ~= lastText then
+            lastText = nextText
+            body.Text = nextText
+        end
+    end
+
+    Render()
+    RunService.Heartbeat:Connect(function()
+        if not sg.Parent then return end
+        pcall(Render)
+    end)
+end
+
+CreateLeftRainbowHud()
