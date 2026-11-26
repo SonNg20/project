@@ -139,19 +139,19 @@ local function CreateLeftRainbowHud()
     body.AutomaticSize = Enum.AutomaticSize.XY
     body.Size = UDim2.new(0, 0, 0, 0)
     body.AnchorPoint = Vector2.new(0, 0)
-    body.Position = UDim2.new(0, 45, 0, 45) -- Góc trên bên trái, dưới Topbar
+    body.Position = UDim2.new(0, 14, 0, 56)
     body.BackgroundTransparency = 1
-    body.Text = "Đang tải..."
+    body.Text = "Đang tải...\nFPS: --"
     body.Font = Enum.Font.GothamBlack
     body.TextSize = 14
+    body.LineHeight = 1.2
     body.TextColor3 = Color3.fromRGB(255, 255, 255)
     body.TextXAlignment = Enum.TextXAlignment.Left
-    body.TextYAlignment = Enum.TextYAlignment.Center
+    body.TextYAlignment = Enum.TextYAlignment.Top
     body.ZIndex = 1000000
     body.Active = true
     body.Parent = sg
 
-    -- Viền chữ đen mỏng giúp chữ cầu vồng nổi rõ kể cả trên nền trắng/sáng
     local textStroke = Instance.new("UIStroke")
     textStroke.Color = Color3.fromRGB(0, 0, 0)
     textStroke.Thickness = 1.6
@@ -164,13 +164,28 @@ local function CreateLeftRainbowHud()
     local cachedData = GetLeaderboardData()
     local lastText = ""
 
+    -- Biến đo FPS trung bình mỗi 0.5 giây để số hiển thị ổn định, không bị nhảy loạn
+    local frameCount = 0
+    local lastFpsUpdate = os.clock()
+    local currentFps = 0
+
     local function Render()
         local now = os.clock()
+        frameCount += 1
 
-        -- Hiệu ứng đổi màu cầu vồng liên tục theo thời gian
+        -- Cập nhật màu cầu vồng
         local hue = (now * 0.25) % 1
         body.TextColor3 = Color3.fromHSV(hue, 0.85, 1)
 
+        -- Tính FPS mỗi 0.5s
+        local fpsElapsed = now - lastFpsUpdate
+        if fpsElapsed >= 0.5 then
+            currentFps = math.floor((frameCount / fpsElapsed) + 0.5)
+            frameCount = 0
+            lastFpsUpdate = now
+        end
+
+        -- Cập nhật Rank | Score mỗi 0.35s
         if (now - lastLbFetch) >= 0.35 then
             lastLbFetch = now
             cachedData = GetLeaderboardData()
@@ -179,7 +194,7 @@ local function CreateLeftRainbowHud()
         local rankStr = cachedData.rank and ("#" .. FormatCommas(cachedData.rank)) or "Unranked"
         local scoreStr = FormatCommas(cachedData.score)
 
-        local nextText = rankStr .. " | " .. scoreStr
+        local nextText = rankStr .. " | " .. scoreStr .. "\nFPS: " .. tostring(currentFps)
 
         if nextText ~= lastText then
             lastText = nextText
